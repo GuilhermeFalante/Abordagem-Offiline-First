@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 import '../models/task.dart';
@@ -21,7 +22,7 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 4,  // VERSÃO FINAL COM TODOS OS CAMPOS
+      version: 5,  // VERSÃO COM sync_queue E pending
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -40,12 +41,24 @@ class DatabaseService {
         priority $textType,
         completed $intType,
         createdAt $textType,
+        pending INTEGER NOT NULL DEFAULT 0,
         photoPath TEXT,
         completedAt TEXT,
         completedBy TEXT,
         latitude REAL,
         longitude REAL,
         locationName TEXT
+      )
+    ''');
+
+    // Tabela de fila de sincronização
+    await db.execute('''
+      CREATE TABLE sync_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL, -- create | update | delete
+        taskId INTEGER,       -- id local (may be null for create until inserted)
+        payload TEXT NOT NULL, -- JSON payload with task data or {id: ...}
+        timestamp TEXT NOT NULL
       )
     ''');
   }
@@ -64,14 +77,40 @@ class DatabaseService {
       await db.execute('ALTER TABLE tasks ADD COLUMN longitude REAL');
       await db.execute('ALTER TABLE tasks ADD COLUMN locationName TEXT');
     }
+    if (oldVersion < 5) {
+      // add pending flag
+      try {
+        await db.execute('ALTER TABLE tasks ADD COLUMN pending INTEGER NOT NULL DEFAULT 0');
+      } catch (_) {
+        // ignore if exists
+      }
+
+      // create sync_queue if not exists
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS sync_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          action TEXT NOT NULL,
+          taskId INTEGER,
+          payload TEXT NOT NULL,
+          timestamp TEXT NOT NULL
+        )
+      ''');
+    }
     print('✅ Banco migrado de v$oldVersion para v$newVersion');
   }
 
   // CRUD Methods
   Future<Task> create(Task task) async {
     final db = await instance.database;
-    final id = await db.insert('tasks', task.toMap());
-    return task.copyWith(id: id);
+    // Mark as pending locally and insert
+    final taskMap = task.copyWith(pending: true).toMap();
+    final id = await db.insert('tasks', taskMap);
+
+    final inserted = task.copyWith(id: id, pending: true);
+    // Enfileira para sincronização
+    await enqueueSync('create', inserted);
+
+    return inserted;
   }
 
   Future<Task?> read(int id) async {
@@ -97,21 +136,60 @@ class DatabaseService {
 
   Future<int> update(Task task) async {
     final db = await instance.database;
-    return db.update(
+    // mark pending and update locally
+    final pendingMap = task.copyWith(pending: true).toMap();
+    final rows = await db.update(
       'tasks',
-      task.toMap(),
+      pendingMap,
       where: 'id = ?',
       whereArgs: [task.id],
     );
+
+    // enqueue sync
+    await enqueueSync('update', task.copyWith(pending: true));
+    return rows;
   }
 
   Future<int> delete(int id) async {
     final db = await instance.database;
+    // enqueue delete action so server can be informed
+    final payload = jsonEncode({'id': id});
+    await db.insert('sync_queue', {
+      'action': 'delete',
+      'taskId': id,
+      'payload': payload,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+
+    // remove locally
     return await db.delete(
       'tasks',
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  // Enqueue helper
+  Future<void> enqueueSync(String action, Task task) async {
+    final db = await instance.database;
+    final payload = jsonEncode(task.toMap());
+    await db.insert('sync_queue', {
+      'action': action,
+      'taskId': task.id,
+      'payload': payload,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+  }
+
+  // Read queued sync entries (small helper for sync worker)
+  Future<List<Map<String, dynamic>>> readSyncQueue() async {
+    final db = await instance.database;
+    return await db.query('sync_queue', orderBy: 'timestamp ASC');
+  }
+
+  Future<int> removeSyncEntry(int id) async {
+    final db = await instance.database;
+    return await db.delete('sync_queue', where: 'id = ?', whereArgs: [id]);
   }
 
   // Método especial: buscar tarefas por proximidade

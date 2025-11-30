@@ -5,6 +5,8 @@ class Task {
   final String priority;
   final bool completed;
   final DateTime createdAt;
+  // Sincronização
+  final bool pending; // true = needs to be synced to server
   
   // CÂMERA
   final String? photoPath;
@@ -31,6 +33,7 @@ class Task {
     this.latitude,
     this.longitude,
     this.locationName,
+    this.pending = false,
   }) : createdAt = createdAt ?? DateTime.now();
 
   // Getters auxiliares
@@ -52,6 +55,7 @@ class Task {
       'latitude': latitude,
       'longitude': longitude,
       'locationName': locationName,
+      'pending': pending ? 1 : 0,
     };
   }
 
@@ -71,6 +75,7 @@ class Task {
       latitude: map['latitude'] as double?,
       longitude: map['longitude'] as double?,
       locationName: map['locationName'] as String?,
+      pending: (map['pending'] != null) ? (map['pending'] as int) == 1 : false,
     );
   }
 
@@ -87,6 +92,7 @@ class Task {
     double? latitude,
     double? longitude,
     String? locationName,
+    bool? pending,
   }) {
     return Task(
       id: id ?? this.id,
@@ -101,6 +107,7 @@ class Task {
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
       locationName: locationName ?? this.locationName,
+      pending: pending ?? this.pending,
     );
   }
 }
