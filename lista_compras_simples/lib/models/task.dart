@@ -5,6 +5,8 @@ class Task {
   final String priority;
   final bool completed;
   final DateTime createdAt;
+  // Last modification time used for LWW conflict resolution
+  final DateTime lastModified;
   // Sincronização
   final bool pending; // true = needs to be synced to server
   
@@ -27,6 +29,7 @@ class Task {
     required this.priority,
     this.completed = false,
     DateTime? createdAt,
+    DateTime? lastModified,
     this.photoPath,
     this.completedAt,
     this.completedBy,
@@ -34,7 +37,9 @@ class Task {
     this.longitude,
     this.locationName,
     this.pending = false,
-  }) : createdAt = createdAt ?? DateTime.now();
+  }) :
+    createdAt = createdAt ?? DateTime.now(),
+    lastModified = lastModified ?? (createdAt ?? DateTime.now());
 
   // Getters auxiliares
   bool get hasPhoto => photoPath != null && photoPath!.isNotEmpty;
@@ -49,6 +54,7 @@ class Task {
       'priority': priority,
       'completed': completed ? 1 : 0,
       'createdAt': createdAt.toIso8601String(),
+      'lastModified': lastModified.toIso8601String(),
       'photoPath': photoPath,
       'completedAt': completedAt?.toIso8601String(),
       'completedBy': completedBy,
@@ -67,6 +73,9 @@ class Task {
       priority: map['priority'] as String,
       completed: (map['completed'] as int) == 1,
       createdAt: DateTime.parse(map['createdAt'] as String),
+      lastModified: map['lastModified'] != null
+          ? DateTime.parse(map['lastModified'] as String)
+          : DateTime.parse(map['createdAt'] as String),
       photoPath: map['photoPath'] as String?,
       completedAt: map['completedAt'] != null 
           ? DateTime.parse(map['completedAt'] as String)
@@ -93,6 +102,7 @@ class Task {
     double? longitude,
     String? locationName,
     bool? pending,
+    DateTime? lastModified,
   }) {
     return Task(
       id: id ?? this.id,
@@ -108,6 +118,7 @@ class Task {
       longitude: longitude ?? this.longitude,
       locationName: locationName ?? this.locationName,
       pending: pending ?? this.pending,
+      lastModified: lastModified ?? this.lastModified,
     );
   }
 }

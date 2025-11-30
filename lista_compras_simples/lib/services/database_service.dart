@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../models/task.dart';
 
 class DatabaseService {
@@ -22,7 +23,7 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 5,  // VERSÃO COM sync_queue E pending
+      version: 6,  // bumped to add lastModified column for LWW
       onCreate: _createDB,
       onUpgrade: _onUpgrade,
     );
@@ -41,6 +42,7 @@ class DatabaseService {
         priority $textType,
         completed $intType,
         createdAt $textType,
+        lastModified $textType,
         pending INTEGER NOT NULL DEFAULT 0,
         photoPath TEXT,
         completedAt TEXT,
@@ -65,7 +67,7 @@ class DatabaseService {
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     // Migração incremental para cada versão
-    if (oldVersion < 2) {
+    if (oldVersion < 5) {
       await db.execute('ALTER TABLE tasks ADD COLUMN photoPath TEXT');
     }
     if (oldVersion < 3) {
@@ -96,21 +98,40 @@ class DatabaseService {
         )
       ''');
     }
+    if (oldVersion < 6) {
+      // add lastModified column and populate it from createdAt
+      try {
+        await db.execute('ALTER TABLE tasks ADD COLUMN lastModified TEXT');
+      } catch (_) {}
+      // set lastModified = createdAt for existing rows where null
+      try {
+        await db.execute("UPDATE tasks SET lastModified = createdAt WHERE lastModified IS NULL");
+      } catch (_) {}
+    }
     print('✅ Banco migrado de v$oldVersion para v$newVersion');
   }
 
   // CRUD Methods
   Future<Task> create(Task task) async {
     final db = await instance.database;
-    // Mark as pending locally and insert
-    final taskMap = task.copyWith(pending: true).toMap();
-    final id = await db.insert('tasks', taskMap);
+    // Decide enqueue behavior based on connectivity
+    final conn = await Connectivity().checkConnectivity();
+    final isOnline = conn != ConnectivityResult.none;
 
-    final inserted = task.copyWith(id: id, pending: true);
-    // Enfileira para sincronização
-    await enqueueSync('create', inserted);
-
-    return inserted;
+    final now = DateTime.now();
+    if (isOnline) {
+      // Online: insert normally (no pending flag), update lastModified
+      final toInsert = task.copyWith(pending: false, lastModified: now).toMap();
+      final id = await db.insert('tasks', toInsert);
+      return task.copyWith(id: id, pending: false, lastModified: now);
+    } else {
+      // Offline: mark pending and enqueue for sync, set lastModified to now
+      final taskMap = task.copyWith(pending: true, lastModified: now).toMap();
+      final id = await db.insert('tasks', taskMap);
+      final inserted = task.copyWith(id: id, pending: true, lastModified: now);
+      await enqueueSync('create', inserted);
+      return inserted;
+    }
   }
 
   Future<Task?> read(int id) async {
@@ -136,42 +157,71 @@ class DatabaseService {
 
   Future<int> update(Task task) async {
     final db = await instance.database;
-    // mark pending and update locally
-    final pendingMap = task.copyWith(pending: true).toMap();
-    final rows = await db.update(
-      'tasks',
-      pendingMap,
-      where: 'id = ?',
-      whereArgs: [task.id],
-    );
-
-    // enqueue sync
-    await enqueueSync('update', task.copyWith(pending: true));
-    return rows;
+    final conn = await Connectivity().checkConnectivity();
+    final isOnline = conn != ConnectivityResult.none;
+    final now = DateTime.now();
+    if (isOnline) {
+      // Online: update normally and mark not pending, bump lastModified
+      final normalMap = task.copyWith(pending: false, lastModified: now).toMap();
+      final rows = await db.update(
+        'tasks',
+        normalMap,
+        where: 'id = ?',
+        whereArgs: [task.id],
+      );
+      return rows;
+    } else {
+      // Offline: mark pending locally and enqueue, bump lastModified
+      final pendingMap = task.copyWith(pending: true, lastModified: now).toMap();
+      final rows = await db.update(
+        'tasks',
+        pendingMap,
+        where: 'id = ?',
+        whereArgs: [task.id],
+      );
+      await enqueueSync('update', task.copyWith(pending: true, lastModified: now));
+      return rows;
+    }
   }
 
   Future<int> delete(int id) async {
     final db = await instance.database;
-    // enqueue delete action so server can be informed
-    final payload = jsonEncode({'id': id});
-    await db.insert('sync_queue', {
-      'action': 'delete',
-      'taskId': id,
-      'payload': payload,
-      'timestamp': DateTime.now().toIso8601String(),
-    });
+    final conn = await Connectivity().checkConnectivity();
+    final isOnline = conn != ConnectivityResult.none;
 
-    // remove locally
-    return await db.delete(
-      'tasks',
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    if (isOnline) {
+      // Online: delete locally (server should be informed by sync layer)
+      return await db.delete(
+        'tasks',
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    } else {
+      // Offline: enqueue delete and remove locally
+      final payload = jsonEncode({'id': id});
+      await db.insert('sync_queue', {
+        'action': 'delete',
+        'taskId': id,
+        'payload': payload,
+        'timestamp': DateTime.now().toIso8601String(),
+      });
+
+      return await db.delete(
+        'tasks',
+        where: 'id = ?',
+        whereArgs: [id],
+      );
+    }
   }
 
   // Enqueue helper
   Future<void> enqueueSync(String action, Task task) async {
     final db = await instance.database;
+    // Only enqueue if offline (safeguard: double-check current connectivity)
+    final conn = await Connectivity().checkConnectivity();
+    final isOnline = conn != ConnectivityResult.none;
+    if (isOnline) return;
+
     final payload = jsonEncode(task.toMap());
     await db.insert('sync_queue', {
       'action': action,
@@ -190,6 +240,15 @@ class DatabaseService {
   Future<int> removeSyncEntry(int id) async {
     final db = await instance.database;
     return await db.delete('sync_queue', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // Apply a server-provided task into local DB preserving server's lastModified.
+  // Uses INSERT OR REPLACE semantics so it will create or overwrite the record.
+  Future<void> applyServerTask(Task task) async {
+    final db = await instance.database;
+    final map = task.copyWith(pending: false).toMap();
+    // Use conflict algorithm replace to ensure the server version wins locally
+    await db.insert('tasks', map, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   // Método especial: buscar tarefas por proximidade

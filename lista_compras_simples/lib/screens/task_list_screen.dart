@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../models/task.dart';
 import '../services/database_service.dart';
+import '../services/sync_service.dart';
 import '../services/sensor_service.dart';
 import '../services/location_service.dart';
 import '../services/camera_service.dart';
@@ -19,18 +22,42 @@ class _TaskListScreenState extends State<TaskListScreen> {
   List<Task> _tasks = [];
   String _filter = 'all';
   bool _isLoading = true;
+  late StreamSubscription<ConnectivityResult> _connectivitySub;
+  bool _isOnline = true;
 
   @override
   void initState() {
     super.initState();
     _loadTasks();
     _setupShakeDetection();
+    _setupConnectivityListener();
   }
 
   @override
   void dispose() {
     SensorService.instance.stop();
+    _connectivitySub.cancel();
     super.dispose();
+  }
+
+  void _setupConnectivityListener() async {
+    // Initial state
+    final initial = await Connectivity().checkConnectivity();
+    setState(() => _isOnline = initial != ConnectivityResult.none);
+
+    // Listen to changes
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((result) async {
+      final online = result != ConnectivityResult.none;
+      if (mounted) {
+        setState(() => _isOnline = online);
+      }
+
+      // When connectivity returns, process sync queue and reload tasks
+      if (online) {
+        await SyncService.instance.processQueue();
+        if (mounted) await _loadTasks();
+      }
+    });
   }
 
   void _setupShakeDetection() {
@@ -435,6 +462,27 @@ class _TaskListScreenState extends State<TaskListScreen> {
             ? const Center(child: CircularProgressIndicator())
             : Column(
                 children: [
+                  // Connectivity banner
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+                    color: _isOnline ? Colors.green.shade600 : Colors.orange.shade800,
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          _isOnline ? Icons.cloud_done : Icons.cloud_off,
+                          color: Colors.white,
+                          size: 18,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _isOnline ? 'Modo Online' : 'Modo Offline',
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ),
                   // CARD DE ESTATÍSTICAS
                   if (_tasks.isNotEmpty)
                     Container(
