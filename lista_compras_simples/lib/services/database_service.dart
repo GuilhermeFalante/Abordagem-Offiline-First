@@ -120,16 +120,17 @@ class DatabaseService {
 
     final now = DateTime.now();
     if (isOnline) {
-      // Online: insert normally (no pending flag), update lastModified
       final toInsert = task.copyWith(pending: false, lastModified: now).toMap();
       final id = await db.insert('tasks', toInsert);
-      return task.copyWith(id: id, pending: false, lastModified: now);
+      final result = task.copyWith(id: id, pending: false, lastModified: now);
+      print('[DB] Local CREATE id=${result.id} lastModified=${result.lastModified.toIso8601String()} pending=${result.pending}');
+      return result;
     } else {
-      // Offline: mark pending and enqueue for sync, set lastModified to now
       final taskMap = task.copyWith(pending: true, lastModified: now).toMap();
       final id = await db.insert('tasks', taskMap);
       final inserted = task.copyWith(id: id, pending: true, lastModified: now);
       await enqueueSync('create', inserted);
+      print('[DB] Local CREATE (offline) id=${inserted.id} lastModified=${inserted.lastModified.toIso8601String()} pending=${inserted.pending}');
       return inserted;
     }
   }
@@ -169,6 +170,7 @@ class DatabaseService {
         where: 'id = ?',
         whereArgs: [task.id],
       );
+      print('[DB] Local UPDATE id=${task.id} lastModified=${now.toIso8601String()} pending=false');
       return rows;
     } else {
       // Offline: mark pending locally and enqueue, bump lastModified
@@ -180,6 +182,7 @@ class DatabaseService {
         whereArgs: [task.id],
       );
       await enqueueSync('update', task.copyWith(pending: true, lastModified: now));
+      print('[DB] Local UPDATE (offline) id=${task.id} lastModified=${now.toIso8601String()} pending=true');
       return rows;
     }
   }
@@ -213,11 +216,8 @@ class DatabaseService {
       );
     }
   }
-
-  // Enqueue helper
   Future<void> enqueueSync(String action, Task task) async {
     final db = await instance.database;
-    // Only enqueue if offline (safeguard: double-check current connectivity)
     final conn = await Connectivity().checkConnectivity();
     final isOnline = conn != ConnectivityResult.none;
     if (isOnline) return;
@@ -231,7 +231,19 @@ class DatabaseService {
     });
   }
 
-  // Read queued sync entries (small helper for sync worker)
+
+  Future<void> enqueueServerChange(Task serverTask) async {
+    final db = await instance.database;
+    final payload = jsonEncode(serverTask.toMap());
+    print('[DB] Enqueue SERVER_UPDATE id=${serverTask.id} serverLastModified=${serverTask.lastModified.toIso8601String()}');
+    await db.insert('sync_queue', {
+      'action': 'server_update',
+      'taskId': serverTask.id,
+      'payload': payload,
+      'timestamp': serverTask.lastModified.toIso8601String(),
+    });
+  }
+
   Future<List<Map<String, dynamic>>> readSyncQueue() async {
     final db = await instance.database;
     return await db.query('sync_queue', orderBy: 'timestamp ASC');
@@ -242,12 +254,9 @@ class DatabaseService {
     return await db.delete('sync_queue', where: 'id = ?', whereArgs: [id]);
   }
 
-  // Apply a server-provided task into local DB preserving server's lastModified.
-  // Uses INSERT OR REPLACE semantics so it will create or overwrite the record.
   Future<void> applyServerTask(Task task) async {
     final db = await instance.database;
     final map = task.copyWith(pending: false).toMap();
-    // Use conflict algorithm replace to ensure the server version wins locally
     await db.insert('tasks', map, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 

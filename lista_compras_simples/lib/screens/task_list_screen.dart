@@ -55,6 +55,11 @@ class _TaskListScreenState extends State<TaskListScreen> {
       // When connectivity returns, process sync queue and reload tasks
       if (online) {
         await SyncService.instance.processQueue();
+        final resolutions = SyncService.instance.takeLastResolutions();
+        if (resolutions.isNotEmpty && mounted) {
+          final parts = resolutions.entries.map((e) => 'Tarefa ${e.key}: ${e.value.toUpperCase()}').join('\n');
+        }
+
         if (mounted) await _loadTasks();
       }
     });

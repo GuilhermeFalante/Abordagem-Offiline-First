@@ -350,11 +350,33 @@ class TaskCard extends StatelessWidget {
                     ),
                   ),
                   
-                  IconButton(
-                    onPressed: onDelete,
-                    icon: const Icon(Icons.delete_outline),
-                    color: Colors.red,
-                    tooltip: 'Deletar',
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        onPressed: onDelete,
+                        icon: const Icon(Icons.delete_outline),
+                        color: Colors.red,
+                        tooltip: 'Deletar',
+                      ),
+
+                      IconButton(
+                        onPressed: () async {
+                          final ok = await SyncService.instance.simulateServerEdit(task.id);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(ok
+                                  ? '✓ Edição simulada no servidor enfileirada'
+                                  : 'Erro ao simular edição no servidor'),
+                              duration: const Duration(seconds: 3),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.cloud_outlined),
+                        color: Colors.blue,
+                        tooltip: 'Simular edição no servidor',
+                      ),
+                    ],
                   ),
                 ],
               ),

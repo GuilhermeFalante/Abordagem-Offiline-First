@@ -166,7 +166,9 @@ class _TaskFormScreenState extends State<TaskFormScreen> {
           longitude: _longitude,
           locationName: _locationName,
         );
-        await DatabaseService.instance.create(newTask);
+  // Log user action for demo
+  print('[UI] User created new task title="${newTask.title}"');
+  await DatabaseService.instance.create(newTask);
         
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -188,7 +190,9 @@ class _TaskFormScreenState extends State<TaskFormScreen> {
           longitude: _longitude,
           locationName: _locationName,
         );
-        await DatabaseService.instance.update(updatedTask);
+  // Log user action for demo
+  print('[UI] User edited task id=${updatedTask.id} title="${updatedTask.title}"');
+  await DatabaseService.instance.update(updatedTask);
         
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(

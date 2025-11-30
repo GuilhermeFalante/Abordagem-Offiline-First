@@ -10,21 +10,17 @@ class SyncService {
   SyncService._init();
   static final SyncService instance = SyncService._init();
 
-  // Keep a short-lived set of recently synced task ids to show a "synced" badge
   final Set<int> _recentlySynced = {};
+  final Map<int, String> _lastResolutions = {};
 
   bool isRecentlySynced(int id) => _recentlySynced.contains(id);
 
   void _markRecentlySynced(int id) {
     _recentlySynced.add(id);
-    // remove after 4 seconds
     Timer(const Duration(seconds: 4), () {
       _recentlySynced.remove(id);
     });
   }
-
-  /// Process the sync_queue: for each entry, simulate sending to server and
-  /// on success remove the entry and mark the local task as not pending.
   Future<void> processQueue() async {
     final conn = await Connectivity().checkConnectivity();
     final isOnline = conn != ConnectivityResult.none;
@@ -38,80 +34,99 @@ class SyncService {
         final int? queueId = entry['id'] as int?;
         final String action = entry['action'] as String;
         final int? taskId = (entry['taskId'] is int) ? entry['taskId'] as int : null;
-        // Parse payload (local task snapshot at enqueue time)
         final String payload = entry['payload'] as String;
         final Map<String, dynamic> localMap = jsonDecode(payload) as Map<String, dynamic>;
         final localTask = Task.fromMap(localMap);
 
-        // Simulate network delay
         await Future.delayed(const Duration(milliseconds: 200));
 
-        // FETCH remote version (stub). Replace with real API call.
+        if (action == 'server_update') {
+          final serverMap = jsonDecode(payload) as Map<String, dynamic>;
+          final serverTask = Task.fromMap(serverMap);
+          print('[SYNC] Processing server_update for id=${serverTask.id} serverLastModified=${serverTask.lastModified.toIso8601String()}');
+          await db.applyServerTask(serverTask);
+          if (serverTask.id != null) _markRecentlySynced(serverTask.id!);
+          if (serverTask.id != null) _lastResolutions[serverTask.id!] = 'server';
+          if (queueId != null) await db.removeSyncEntry(queueId);
+          continue;
+        }
+
         final Map<String, dynamic>? remote = await _fetchRemoteTask(taskId);
 
         if (action == 'delete') {
-          // Inform server about delete (stub)
           final pushed = await _pushDeleteToServer(taskId);
           if (pushed && queueId != null) await db.removeSyncEntry(queueId);
-          // local row likely already removed when enqueued
         } else {
-          // CREATE or UPDATE: apply LWW: compare lastModified timestamps
           if (remote != null && remote['lastModified'] != null) {
             final remoteLast = DateTime.parse(remote['lastModified'] as String);
             if (remoteLast.isAfter(localTask.lastModified)) {
-              // Server has newer version -> overwrite local
               final serverTask = Task.fromMap(remote);
-              // write serverTask to local DB and mark not pending (preserve server lastModified)
-              await db.applyServerTask(serverTask);
-              if (serverTask.id != null) _markRecentlySynced(serverTask.id!);
+                print('[SYNC] Remote is newer for id=${serverTask.id}. remoteLast=$remoteLast localLast=${localTask.lastModified} -> applying SERVER');
+                await db.applyServerTask(serverTask);
+                if (serverTask.id != null) _markRecentlySynced(serverTask.id!);
+                if (serverTask.id != null) _lastResolutions[serverTask.id!] = 'server';
             } else {
-              // Local is newer -> push to server
               final pushed = await _pushToServer(localTask);
               if (pushed) {
-                // mark local as synced
                 if (localTask.id != null) {
                   await db.update(localTask.copyWith(pending: false));
                   _markRecentlySynced(localTask.id!);
+                    print('[SYNC] Local is newer for id=${localTask.id}. localLast=${localTask.lastModified} remoteLast=$remoteLast -> pushing LOCAL');
+                    _lastResolutions[localTask.id!] = 'local';
                 }
               }
             }
           } else {
-            // No remote version -> push local to server (create)
             final pushed = await _pushToServer(localTask);
             if (pushed && localTask.id != null) {
               await db.update(localTask.copyWith(pending: false));
               _markRecentlySynced(localTask.id!);
+              print('[SYNC] No remote exists for id=${localTask.id} -> pushed LOCAL with lastModified=${localTask.lastModified.toIso8601String()}');
+              _lastResolutions[localTask.id!] = 'local';
             }
           }
 
-          // remove queue entry after processing
           if (queueId != null) await db.removeSyncEntry(queueId);
         }
       } catch (_) {
-        // If one entry fails, skip and continue; will retry later
         continue;
       }
     }
   }
 
-  // ----- Stubs for remote interactions (replace with real API calls) -----
   Future<Map<String, dynamic>?> _fetchRemoteTask(int? id) async {
-    // TODO: Implement actual HTTP GET to server to retrieve task by id.
-    // Return null if remote not found. For now return null to indicate no remote.
     return null;
   }
 
   Future<bool> _pushToServer(Task task) async {
-    // TODO: Implement actual HTTP POST/PUT to push task to server.
-    // Should include task.lastModified so server can store its timestamp.
-    // For demo we assume success.
     await Future.delayed(const Duration(milliseconds: 150));
     return true;
   }
 
   Future<bool> _pushDeleteToServer(int? id) async {
-    // TODO: Implement actual HTTP DELETE to remove remote task.
     await Future.delayed(const Duration(milliseconds: 100));
     return true;
+  }
+  Future<bool> simulateServerEdit(int? taskId) async {
+    if (taskId == null) return false;
+    final db = DatabaseService.instance;
+    final local = await db.read(taskId);
+    if (local == null) return false;
+
+    final serverTs = DateTime.now().add(const Duration(seconds: 30));
+    final serverTask = local.copyWith(
+      lastModified: serverTs,
+      pending: false,
+      description: '${local.description} (alterado no servidor)'
+    );
+
+    print('[SYNC] Simulating server edit for id=${taskId} serverLastModified=${serverTs.toIso8601String()} (enqueued)');
+    await db.enqueueServerChange(serverTask);
+    return true;
+  }
+  Map<int, String> takeLastResolutions() {
+    final copy = Map<int, String>.from(_lastResolutions);
+    _lastResolutions.clear();
+    return copy;
   }
 }
